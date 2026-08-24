@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readJson, writeJson, expandHome, ensureDir, pathExists } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { TEAMAI_HOOK_DESCRIPTION_PREFIX, TEAMAI_CUSTOM_HOOK_PREFIX, TEAMAI_AGENT_HOOK_PREFIX, getManagedHooksPath, resolveBaseDir } from './types.js';
@@ -68,6 +69,9 @@ interface CodexHookEntry {
   type: string;
   command: string;
   timeout?: number;
+  /** ZCode-only: shell-free `process` form (argument vector, no shell). */
+  args?: string[];
+  timeoutMs?: number;
 }
 
 interface CodexHookMatcher {
@@ -242,18 +246,43 @@ function toCodexEntry(def: HookDef): CodexHookMatcher {
  * never match. An omitted matcher matches everything, which is what "*" means
  * in the claude family.
  */
-function toZcodeEntry(def: HookDef): ZcodeHookMatcher {
-  const entry: ZcodeHookMatcher = {
-    hooks: [
-      {
-        type: 'command',
-        command: def.command,
-        ...(def.timeout !== undefined ? { timeout: def.timeout } : {}),
-      },
-    ],
-  };
-  if (def.matcher && def.matcher !== '*') entry.matcher = def.matcher;
-  return entry;
+function toZcodeEntry(def: HookDef, tool: string): ZcodeHookMatcher {
+  // ZCode runs `command`-type hooks through cmd.exe on Windows, where the
+  // upstream `bash -lc "…" || true` template breaks: `||` chains run in cmd
+  // semantics and `true` is not a cmd builtin; non-JSON stdout also fails
+  // ZCode's strict output validation. Use the shell-free `process` form
+  // (ZCode docs' portable choice): spawn this CLI's own node runtime and
+  // entry file directly with an argument vector.
+  const dispatch = /hook-dispatch (\S+)/.exec(def.command)?.[1];
+  let entry: CodexHookEntry;
+  if (dispatch) {
+    const selfEntry = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      'index.js',
+    );
+    entry = {
+      type: 'process',
+      command: process.execPath,
+      args: [
+        selfEntry,
+        'hook-dispatch',
+        dispatch,
+        '--tool',
+        tool,
+        ...(def.matcher && def.matcher !== '*' ? ['--matcher', def.matcher] : []),
+      ],
+      ...(def.timeout !== undefined ? { timeoutMs: def.timeout * 1000 } : {}),
+    };
+  } else {
+    entry = {
+      type: 'command',
+      command: def.command,
+      ...(def.timeout !== undefined ? { timeout: def.timeout } : {}),
+    };
+  }
+  const m: ZcodeHookMatcher = { hooks: [entry] };
+  if (def.matcher && def.matcher !== '*') m.matcher = def.matcher;
+  return m;
 }
 
 /** Ordered, de-duplicated list of events appearing in the desired defs. */
@@ -469,8 +498,15 @@ async function reconcileZcodeFormat(
   if (!config.hooks.events) config.hooks.events = {};
 
   const isManaged = (entry: ZcodeHookMatcher): boolean => {
-    const cmd = entry.hooks?.[0]?.command ?? '';
-    return TEAMAI_COMMAND_MARKERS.some((marker) => cmd.includes(marker)) || priorTeamCommands.has(cmd);
+    const h = entry.hooks?.[0];
+    // `process`-form entries carry node in `command` and the teamai argv in
+    // `args`, so match on the joined vector as well as the raw command.
+    const vector = `${h?.command ?? ''} ${(h?.args ?? []).join(' ')}`;
+    return (
+      TEAMAI_COMMAND_MARKERS.some((marker) => vector.includes(marker)) ||
+      (vector.includes('hook-dispatch') && vector.includes('--tool')) ||
+      priorTeamCommands.has(h?.command ?? '')
+    );
   };
 
   const defs = opts.removeAll ? [] : desiredDefs(tool, teamDefs, opts.builtinOverride);
@@ -481,7 +517,7 @@ async function reconcileZcodeFormat(
   for (const event of events) {
     const existing = config.hooks.events[event] ?? [];
     const untouched = existing.filter((e) => !isManaged(e));
-    const desiredEntries = defs.filter((d) => d.event === event).map(toZcodeEntry);
+    const desiredEntries = defs.filter((d) => d.event === event).map((d) => toZcodeEntry(d, tool));
     const newArr = [...untouched, ...desiredEntries];
     if (JSON.stringify(existing) !== JSON.stringify(newArr)) {
       config.hooks.events[event] = newArr;

@@ -73,7 +73,14 @@ describe('zcode hooks', () => {
     // Same event set as the other PascalCase backends.
     expect(Object.keys(events)).toEqual(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit']);
     expect(events.PostToolUse).toHaveLength(3);
-    expect(events.SessionStart[0].hooks[0].command).toContain('--tool zcode');
+    // ZCode runs command hooks via cmd.exe on Windows, so teamai entries use
+    // the shell-free process form: node + entry file + argument vector.
+    const first = events.SessionStart[0].hooks[0];
+    expect(first.type).toBe('process');
+    expect(first.command).toBe(process.execPath);
+    expect(first.args).toContain('--tool');
+    expect(first.args).toContain('zcode');
+    expect(first.args?.join(' ')).toContain('hook-dispatch');
     // ZCode documents no description field — entries carry none.
     expect(events.SessionStart[0].description).toBeUndefined();
   });
@@ -112,7 +119,7 @@ describe('zcode hooks', () => {
     const session = doc.hooks.events.SessionStart;
     // User's own entry survives alongside the teamai one.
     expect(session.some((e) => e.hooks[0].command === 'echo user-hook')).toBe(true);
-    expect(session.some((e) => (e.hooks[0].command ?? '').includes('teamai hook-dispatch'))).toBe(true);
+    expect(session.some((e) => (e.hooks[0].args ?? []).includes('hook-dispatch'))).toBe(true);
   });
 
   it('flips hooks.enabled on when writing into an existing config', async () => {
