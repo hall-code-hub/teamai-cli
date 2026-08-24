@@ -629,6 +629,192 @@ servers:
   });
 });
 
+describe('MCP reconcile — ZCode', () => {
+  let tmpDir: string;
+  let homeDir: string;
+  let repoPath: string;
+  let teamConfig: TeamaiConfig;
+  let localConfig: LocalConfig;
+
+  const ZCODE_TOOL_PATHS = {
+    zcode: {
+      skills: '.zcode/skills',
+      rules: '.zcode/rules',
+      agents: '.zcode/agents',
+      settings: '.zcode/cli/config.json',
+      mcp: '.zcode/cli/config.json',
+      mcpProject: '.zcode/config.json',
+    },
+  };
+
+  async function writeMcpYaml(body: string): Promise<void> {
+    await fse.ensureDir(path.join(repoPath, 'mcp'));
+    await fse.writeFile(path.join(repoPath, 'mcp', 'mcp.yaml'), body);
+  }
+
+  beforeEach(async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-mcp-zcode-test-'));
+    homeDir = path.join(tmpDir, 'home');
+    repoPath = path.join(tmpDir, 'team-repo');
+    // ZCode "installed" at user scope: ~/.zcode exists.
+    await fse.ensureDir(path.join(homeDir, '.zcode', 'skills'));
+    await fse.ensureDir(path.join(homeDir, '.teamai'));
+
+    vi.stubEnv('HOME', homeDir);
+
+    teamConfig = {
+      team: 't', description: '', repo: 'r', provider: 'tgit', reviewers: [],
+      sharing: {
+        skills: {}, rules: { enforced: [] }, docs: { localDir: '~/.teamai/docs' },
+        env: { injectShellProfile: false }, mcp: { autoApply: true, allowedCommands: [], allowedHosts: [] },
+      },
+      toolPaths: ZCODE_TOOL_PATHS,
+    } as unknown as TeamaiConfig;
+
+    localConfig = {
+      repo: { localPath: repoPath, remote: 'r' },
+      username: 'u', scope: 'user', additionalRoles: [],
+    } as unknown as LocalConfig;
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  const zcConfig = () => path.join(homeDir, '.zcode', 'cli', 'config.json');
+
+  it('writes stdio servers under the two-level mcp.servers nest, in zcode shape', async () => {
+    await writeMcpYaml(`
+servers:
+  - name: local-srv
+    transport: stdio
+    command: my-server
+    args: ["--port", "3000"]
+    env:
+      FOO: bar
+`);
+    await reconcileMcpForConfig(teamConfig, localConfig);
+
+    const doc = await fse.readJson(zcConfig());
+    // Nested at mcp.servers — NOT the single-level mcpServers everyone else uses.
+    expect(doc.mcpServers).toBeUndefined();
+    expect(doc.mcp.servers['local-srv']).toEqual({
+      command: 'my-server',
+      args: ['--port', '3000'],
+      env: { FOO: 'bar' },
+    });
+  });
+
+  it('renders an http server with url + http_headers (not headers)', async () => {
+    await writeMcpYaml(`
+servers:
+  - name: remote-srv
+    transport: http
+    url: https://example.com/mcp
+    headers:
+      Authorization: Bearer tok
+`);
+    await reconcileMcpForConfig(teamConfig, localConfig);
+
+    const doc = await fse.readJson(zcConfig());
+    expect(doc.mcp.servers['remote-srv']).toEqual({
+      url: 'https://example.com/mcp',
+      http_headers: { Authorization: 'Bearer tok' },
+    });
+  });
+
+  it('preserves the rest of config.json (skills overrides, plugins, sibling servers)', async () => {
+    await fse.ensureDir(path.dirname(zcConfig()));
+    await fse.writeJson(zcConfig(), {
+      skills: { 'C:/Users/x/skills': { enabled: false } },
+      command: { foo: 'bar' },
+      mcp: { servers: { mine: { command: 'x' } } },
+    });
+    await writeMcpYaml(`
+servers:
+  - name: team-srv
+    transport: http
+    url: https://team.example/mcp
+`);
+    await reconcileMcpForConfig(teamConfig, localConfig);
+
+    const doc = await fse.readJson(zcConfig());
+    expect(doc.skills).toEqual({ 'C:/Users/x/skills': { enabled: false } });
+    expect(doc.command).toEqual({ foo: 'bar' });
+    expect(doc.mcp.servers.mine).toEqual({ command: 'x' });
+    expect(doc.mcp.servers['team-srv'].url).toBe('https://team.example/mcp');
+  });
+
+  it('is idempotent and removes a dropped team server later', async () => {
+    await writeMcpYaml(`
+servers:
+  - name: temp
+    transport: http
+    url: https://example.com/mcp
+`);
+    const first = await reconcileMcpForConfig(teamConfig, localConfig);
+    expect(first.wrote).toBe(true);
+
+    const mtimeBefore = (await fse.stat(zcConfig())).mtimeMs;
+    const second = await reconcileMcpForConfig(teamConfig, localConfig);
+    expect(second.wrote).toBe(false);
+    expect((await fse.stat(zcConfig())).mtimeMs).toBe(mtimeBefore);
+
+    await writeMcpYaml('servers: []\n');
+    await reconcileMcpForConfig(teamConfig, localConfig);
+    const doc = await fse.readJson(zcConfig());
+    expect(doc.mcp.servers.temp).toBeUndefined();
+    // The mcp nest itself survives the removal.
+    expect(doc.mcp).toBeDefined();
+  });
+
+  it('still skips sse, which zcode has no transport for', async () => {
+    await writeMcpYaml(`
+servers:
+  - name: streamy
+    transport: sse
+    url: https://example.com/sse
+`);
+    const { changes } = await reconcileMcpForConfig(teamConfig, localConfig);
+    expect(changes).toContainEqual(
+      expect.objectContaining({ tool: 'zcode', server: 'streamy', action: 'skipped' }),
+    );
+    expect(await fse.pathExists(zcConfig())).toBe(false);
+  });
+
+  it('project scope writes <root>/.zcode/config.json (mcpProject), not the user file', async () => {
+    const projectRoot = path.join(tmpDir, 'proj');
+    await fse.ensureDir(path.join(projectRoot, '.zcode', 'skills'));
+    const projectConfig = { ...localConfig, scope: 'project', projectRoot } as unknown as LocalConfig;
+
+    await writeMcpYaml(`
+servers:
+  - name: s1
+    transport: http
+    url: https://example.com/mcp
+`);
+    await reconcileMcpForConfig(teamConfig, projectConfig);
+
+    const doc = await fse.readJson(path.join(projectRoot, '.zcode', 'config.json'));
+    expect(doc.mcp.servers.s1.url).toBe('https://example.com/mcp');
+    // The user-level file must not be created from project scope.
+    expect(await fse.pathExists(zcConfig())).toBe(false);
+  });
+
+  it('skips zcode when ~/.zcode is absent', async () => {
+    await fse.remove(path.join(homeDir, '.zcode'));
+    await writeMcpYaml(`
+servers:
+  - name: s1
+    transport: http
+    url: https://example.com/mcp
+`);
+    await reconcileMcpForConfig(teamConfig, localConfig);
+    expect(await fse.pathExists(zcConfig())).toBe(false);
+  });
+});
+
 describe('spliceCodexBlock', () => {
   it('replaces a block and its nested env sub-table, leaving neighbours intact', () => {
     const src = [

@@ -9,17 +9,19 @@ import type { McpServerDef, McpTransport } from '../types.js';
 //    cursor          { "url", "headers" }                     (type omitted)
 //    buddy family    { "transportType": "streamable-http", … } (+ timeout)
 //    codex           [mcp_servers.<name>] TOML table          (stdio + http)
+//    zcode           { "command", "args", "env" } / { "url", "http_headers" }
 //
 //  Keeping the differences here — rather than in the reconcile engine — is the
 //  same split agents uses between agent-format.ts and its handler.
 
-export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode';
+export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'zcode';
 
 const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude']);
 const CURSOR_TOOLS = new Set(['cursor']);
 const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
 const BUDDY_TOOLS = new Set(['codebuddy', 'workbuddy']);
 const OPENCODE_TOOLS = new Set(['opencode']);
+const ZCODE_TOOLS = new Set(['zcode']);
 
 export function detectMcpFormat(tool: string): McpFormat | null {
   if (CLAUDE_TOOLS.has(tool)) return 'claude';
@@ -27,19 +29,22 @@ export function detectMcpFormat(tool: string): McpFormat | null {
   if (CODEX_TOOLS.has(tool)) return 'codex';
   if (BUDDY_TOOLS.has(tool)) return 'buddy';
   if (OPENCODE_TOOLS.has(tool)) return 'opencode';
+  if (ZCODE_TOOLS.has(tool)) return 'zcode';
   return null;
 }
 
 /**
  * Top-level JSON key each format stores its server map under. Claude/cursor/buddy
  * all use `mcpServers`; OpenCode uses `mcp`. Codex is TOML (handled separately) and
- * has no entry here.
+ * has no entry here. ZCode nests the map two levels deep (`mcp.servers`), spelled
+ * here as a dotted path the reconcile engine resolves level by level.
  */
 export const MCP_SERVER_KEY: Record<Exclude<McpFormat, 'codex'>, string> = {
   claude: 'mcpServers',
   cursor: 'mcpServers',
   buddy: 'mcpServers',
   opencode: 'mcp',
+  zcode: 'mcp.servers',
 };
 
 /** Transports each format can actually express. */
@@ -53,6 +58,9 @@ const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
   // OpenCode splits transports into `type: local` (stdio) and `type: remote`
   // (streamable HTTP). It has no SSE transport.
   opencode: new Set<McpTransport>(['stdio', 'http']),
+  // ZCode speaks stdio (`command`/`args`/`env`) and streamable HTTP (`url` +
+  // `http_headers`). No SSE transport is attested (docs or real configs).
+  zcode: new Set<McpTransport>(['stdio', 'http']),
 };
 
 export function supportsTransport(format: McpFormat, transport: McpTransport): boolean {
@@ -251,11 +259,33 @@ function renderOpencode(def: McpServerDef): McpJsonEntry {
   return e;
 }
 
+/**
+ * ZCode's shape (verified against a real ~/.zcode/cli/config.json): a stdio
+ * server is `{ command, args, env }` with no `type` discriminator, and a remote
+ * server is `{ url, http_headers }` — the header key is `http_headers`, not
+ * `headers`. No `enable`/`enabled` field is written: absence means enabled,
+ * which sidesteps the enable-vs-enabled discrepancy between ZCode's docs and
+ * its real config files.
+ */
+function renderZcode(def: McpServerDef): McpJsonEntry {
+  const e: McpJsonEntry = {};
+  if (def.transport === 'stdio') {
+    e.command = def.command;
+    if (def.args?.length) e.args = def.args;
+    if (def.env && Object.keys(def.env).length) e.env = def.env;
+  } else {
+    e.url = def.url;
+    if (def.headers && Object.keys(def.headers).length) e.http_headers = def.headers;
+  }
+  return e;
+}
+
 /** Render the JSON-shaped entry for a format. Codex is handled separately (TOML). */
 export function renderJsonEntry(format: Exclude<McpFormat, 'codex'>, def: McpServerDef): McpJsonEntry {
   if (format === 'claude') return renderClaude(def);
   if (format === 'cursor') return renderCursor(def);
   if (format === 'opencode') return renderOpencode(def);
+  if (format === 'zcode') return renderZcode(def);
   return renderBuddy(def);
 }
 

@@ -29,11 +29,13 @@ import {
   renderForCodexInternal,
   renderForCursor,
   renderForOpencode,
+  renderForZcode,
   reverseFromClaude,
   reverseFromCodebuddy,
   reverseFromCodex,
   reverseFromCursor,
   reverseFromOpencode,
+  reverseFromZcode,
   renderForTool,
   mergeReverseResults,
 } from '../resources/agent-format.js';
@@ -682,5 +684,81 @@ describe('AgentsHandler.pullItem — multi-target', () => {
     expect(await fse.pathExists(path.join(homeDir, '.codebuddy', 'agents', 'legacy.md'))).toBe(true);
     // codex is not a legacy target
     expect(await fse.pathExists(path.join(homeDir, '.codex', 'agents', 'legacy.md'))).toBe(false);
+  });
+});
+
+// ─── renderForZcode ──────────────────────────────────────────────────────────
+
+describe('renderForZcode', () => {
+  it('renders Claude-compatible frontmatter with name (ZCode requires it in-file)', () => {
+    const { ext, content } = renderForZcode(makeSpec());
+    expect(ext).toBe('.md');
+    expect(content).toContain('name: test-agent');
+    expect(content).toContain('description: A test agent for unit tests');
+    expect(content).toContain('You are a helpful assistant.');
+  });
+
+  it('includes model and tools like the claude renderer', () => {
+    const spec = makeSpec({ model: 'glm-4.6', tools: ['Bash', 'Read'] });
+    const { content } = renderForZcode(spec);
+    expect(content).toContain('model: glm-4.6');
+    expect(content).toContain('Bash');
+  });
+
+  it('flattens tool_extras.zcode (maxTurns/injectAgentsMd) into frontmatter', () => {
+    const spec = makeSpec({ tool_extras: { zcode: { maxTurns: 5, injectAgentsMd: false } } });
+    const { content } = renderForZcode(spec);
+    expect(content).toContain('maxTurns: 5');
+    expect(content).toContain('injectAgentsMd: false');
+  });
+
+  it('renderForTool dispatches zcode to renderForZcode', () => {
+    const spec = makeSpec();
+    const viaTool = renderForTool(spec, 'zcode');
+    const direct = renderForZcode(spec);
+    expect(viaTool).toEqual(direct);
+  });
+
+  it('zcode render matches the claude render for a plain spec', () => {
+    // ZCode subagents are Claude-compatible; only the extras key differs.
+    const spec = makeSpec();
+    expect(renderForZcode(spec)).toEqual(renderForClaude(spec));
+  });
+});
+
+// ─── reverseFromZcode ────────────────────────────────────────────────────────
+
+describe('reverseFromZcode', () => {
+  it('reads name/description and round-trips a rendered file', () => {
+    const rendered = renderForZcode(makeSpec());
+    const result = reverseFromZcode('/.zcode/agents/test-agent.md', rendered.content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.name).toBe('test-agent');
+    expect(result.spec.description).toBe('A test agent for unit tests');
+    expect(result.spec.instructions).toContain('You are a helpful assistant.');
+  });
+
+  it('collects zcode-only fields into tool_extras.zcode, not .claude', () => {
+    const content = `---\nname: a\ndescription: b\nmaxTurns: 5\n---\nBody\n`;
+    const result = reverseFromZcode('/agents/a.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.tool_extras?.['zcode']).toEqual({ maxTurns: 5 });
+    expect(result.spec.tool_extras?.['claude']).toBeUndefined();
+  });
+
+  it('falls back to the filename stem when frontmatter has no name', () => {
+    const content = `---\ndescription: b\n---\nBody\n`;
+    const result = reverseFromZcode('/agents/zc-agent.md', content);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.spec.name).toBe('zc-agent');
+  });
+
+  it('returns error on missing description', () => {
+    const content = `---\nname: a\n---\nBody\n`;
+    const result = reverseFromZcode('/agents/a.md', content);
+    expect(result.ok).toBe(false);
   });
 });

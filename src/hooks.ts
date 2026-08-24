@@ -80,6 +80,28 @@ interface CodexHooksJson {
   [key: string]: unknown;
 }
 
+/**
+ * ZCode's on-disk hooks shape (~/.zcode/cli/config.json → `hooks` key). Same
+ * matcher/entry structure as claude/codex, but events nest one level deeper
+ * (`hooks.events.<Event>`), the whole block is dead unless `enabled: true` is
+ * set, and `matcher` is a regex (so a claude-style "*" wildcard must be
+ * omitted, not written). The rest of config.json (skills overrides, mcp
+ * servers, plugins) shares the file, so edits are key-level surgery.
+ */
+interface ZcodeHookMatcher {
+  matcher?: string;
+  hooks: CodexHookEntry[];
+}
+
+interface ZcodeHooksJson {
+  hooks?: {
+    enabled?: boolean;
+    events?: Record<string, ZcodeHookMatcher[]>;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
 // ─── Unified reconcile engine (issue #19) ───────────────────
 //
 //  A single engine injects BOTH built-in operational hooks (source: 'builtin',
@@ -88,20 +110,22 @@ interface CodexHooksJson {
 //  marker namespaces:
 //    - built-in:  description starts with "[teamai] " / command matches a marker
 //    - team:      description starts with "[teamai:hook:<id>]"
-//  Cursor and Codex hook files carry no description, so team hooks there are
-//  tracked via the managed-hooks manifest (see ManagedHooksManifest).
+//  Cursor, Codex and ZCode hook files carry no description, so team hooks there
+//  are tracked via the managed-hooks manifest (see ManagedHooksManifest).
 //
 //  Reconcile is idempotent and only writes when content actually changes, so an
 //  upgraded CLI re-running over an already-injected file produces a zero-diff.
 
-type ToolFormat = 'claude' | 'cursor' | 'codex';
+type ToolFormat = 'claude' | 'cursor' | 'codex' | 'zcode';
 export type HookStatus = 'installed' | 'missing';
 
 const CURSOR_TOOLS = new Set(['cursor']);
 const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
+const ZCODE_TOOLS = new Set(['zcode']);
 
 function detectFormat(tool: string): ToolFormat {
   if (CODEX_TOOLS.has(tool)) return 'codex';
+  if (ZCODE_TOOLS.has(tool)) return 'zcode';
   return CURSOR_TOOLS.has(tool) ? 'cursor' : 'claude';
 }
 
@@ -198,6 +222,28 @@ function toCursorEntry(def: HookDef): CursorHookEntry {
 
 function toCodexEntry(def: HookDef): CodexHookMatcher {
   const entry: CodexHookMatcher = {
+    hooks: [
+      {
+        type: 'command',
+        command: def.command,
+        ...(def.timeout !== undefined ? { timeout: def.timeout } : {}),
+      },
+    ],
+  };
+  if (def.matcher && def.matcher !== '*') entry.matcher = def.matcher;
+  return entry;
+}
+
+/**
+ * Render a HookDef as a ZCode matcher entry. Same entry shape as codex (no
+ * description — managed entries are identified by command markers / manifest),
+ * except nothing is written for the "*" wildcard: ZCode matchers are
+ * case-sensitive regexes, "*" is an invalid regex there and would silently
+ * never match. An omitted matcher matches everything, which is what "*" means
+ * in the claude family.
+ */
+function toZcodeEntry(def: HookDef): ZcodeHookMatcher {
+  const entry: ZcodeHookMatcher = {
     hooks: [
       {
         type: 'command',
@@ -398,6 +444,65 @@ async function reconcileCodexFormat(
   }
 }
 
+// ─── ZCode (~/.zcode/cli/config.json) reconcile ─────────────
+
+/**
+ * Reconcile hooks inside ZCode's user-level config.json. Same managed-entry
+ * identification as codex (command markers + manifest, no description field),
+ * with two zcode-specific twists: events live under `hooks.events.<Event>`,
+ * and the whole block is inert unless `hooks.enabled === true`, so any write
+ * also ensures the flag is on. The flag is never turned back off — the user
+ * may run their own config-file hooks. Everything else in config.json (skills
+ * overrides, mcp servers, plugins) is carried over untouched.
+ */
+async function reconcileZcodeFormat(
+  configPath: string,
+  tool: string,
+  teamDefs: HookDef[],
+  opts: ReconcileHooksOptions,
+  priorTeamCommands: Set<string>,
+): Promise<void> {
+  const expanded = expandHome(configPath);
+  await ensureDir(path.dirname(expanded));
+  const config: ZcodeHooksJson = (await readJson<ZcodeHooksJson>(expanded)) ?? {};
+  if (!config.hooks) config.hooks = {};
+  if (!config.hooks.events) config.hooks.events = {};
+
+  const isManaged = (entry: ZcodeHookMatcher): boolean => {
+    const cmd = entry.hooks?.[0]?.command ?? '';
+    return TEAMAI_COMMAND_MARKERS.some((marker) => cmd.includes(marker)) || priorTeamCommands.has(cmd);
+  };
+
+  const defs = opts.removeAll ? [] : desiredDefs(tool, teamDefs, opts.builtinOverride);
+  const eventOrder = desiredEventOrder(defs, (e) => e);
+  const events = [...eventOrder, ...Object.keys(config.hooks.events).filter((e) => !eventOrder.includes(e))];
+
+  let changed = false;
+  for (const event of events) {
+    const existing = config.hooks.events[event] ?? [];
+    const untouched = existing.filter((e) => !isManaged(e));
+    const desiredEntries = defs.filter((d) => d.event === event).map(toZcodeEntry);
+    const newArr = [...untouched, ...desiredEntries];
+    if (JSON.stringify(existing) !== JSON.stringify(newArr)) {
+      config.hooks.events[event] = newArr;
+      changed = true;
+    }
+  }
+  // Config-file hooks are disabled by default in ZCode — flip the switch on
+  // any write so the entries we manage actually run.
+  if (config.hooks.enabled !== true) {
+    config.hooks.enabled = true;
+    changed = true;
+  }
+
+  if (changed) {
+    await writeJson(expanded, config);
+    log.success(`${opts.removeAll ? 'Removed' : 'Updated'} teamai hooks in ${configPath}`);
+  } else {
+    log.debug(`teamai hooks already up-to-date in ${configPath}`);
+  }
+}
+
 // ─── Agent hooks (HTTP-source, issue #238) ──────────────────
 
 /**
@@ -475,11 +580,27 @@ export async function applyAgentHook(
     description: agentHookDescription(def.slug),
   };
 
-  // Codex entries carry no description field, so agent hooks are matched by
-  // their exact command string (and tracked in the local-agent agent-hook
-  // manifest, the authoritative record for codex teardown). Backends must use
-  // a unique command per codex agent-hook slug so replace/remove stay precise.
-  if (format === 'codex') {
+  // Codex and ZCode entries carry no description field, so agent hooks are
+  // matched by their exact command string (and tracked in the local-agent
+  // agent-hook manifest, the authoritative record for codex/zcode teardown).
+  // Backends must use a unique command per agent-hook slug so replace/remove
+  // stay precise.
+  if (format === 'zcode') {
+    const config: ZcodeHooksJson = (await readJson<ZcodeHooksJson>(expanded)) ?? {};
+    if (!config.hooks) config.hooks = {};
+    if (!config.hooks.events) config.hooks.events = {};
+    const existing = config.hooks.events[def.event] ?? [];
+    const untouched = existing.filter((e) => (e.hooks?.[0]?.command ?? '') !== def.command);
+    const newArr = [...untouched, toZcodeEntry(hookDef)];
+    if (JSON.stringify(existing) !== JSON.stringify(newArr)) {
+      config.hooks.events[def.event] = newArr;
+      config.hooks.enabled = true;
+      await writeJson(expanded, config);
+      log.success(`Installed agent hook [${def.slug}] in ${settingsPath}`);
+    } else {
+      log.debug(`agent hook [${def.slug}] already up-to-date in ${settingsPath}`);
+    }
+  } else if (format === 'codex') {
     const hooksJson: CodexHooksJson = (await readJson<CodexHooksJson>(expanded)) ?? {};
     if (!hooksJson.hooks) hooksJson.hooks = {};
     const existing = hooksJson.hooks[def.event] ?? [];
@@ -522,10 +643,31 @@ export async function removeAgentHook(
   if (!(await pathExists(expanded))) return;
   const format = detectFormat(tool);
 
-  // Codex removal matches by command (no marker in the file); callers pass the
-  // command recorded in the agent-hook manifest, which is the source of truth
-  // for codex teardown.
-  if (format === 'codex') {
+  // Codex and ZCode removal match by command (no marker in the file); callers
+  // pass the command recorded in the agent-hook manifest, which is the source
+  // of truth for teardown.
+  if (format === 'zcode') {
+    if (!opts.command) return;
+    const config: ZcodeHooksJson = (await readJson<ZcodeHooksJson>(expanded)) ?? {};
+    if (!config.hooks?.events) return;
+    let changed = false;
+    for (const event of Object.keys(config.hooks.events)) {
+      const before = config.hooks.events[event];
+      const after = before.filter((e) => (e.hooks?.[0]?.command ?? '') !== opts.command);
+      if (after.length !== before.length) {
+        changed = true;
+        if (after.length === 0) {
+          delete config.hooks.events[event];
+        } else {
+          config.hooks.events[event] = after;
+        }
+      }
+    }
+    if (changed) {
+      await writeJson(expanded, config);
+      log.success(`Removed agent hook [${opts.slug}] from ${settingsPath}`);
+    }
+  } else if (format === 'codex') {
     if (!opts.command) return;
     const hooksJson: CodexHooksJson = (await readJson<CodexHooksJson>(expanded)) ?? {};
     if (!hooksJson.hooks) return;
@@ -590,6 +732,8 @@ export async function reconcileHooks(
     await reconcileCursorFormat(settingsPath, tool, teamDefs, opts, priorTeamCommands);
   } else if (format === 'codex') {
     await reconcileCodexFormat(settingsPath, tool, teamDefs, opts, priorTeamCommands);
+  } else if (format === 'zcode') {
+    await reconcileZcodeFormat(settingsPath, tool, teamDefs, opts, priorTeamCommands);
   } else {
     await reconcileClaudeFormat(settingsPath, tool, teamDefs, opts, teamActive);
   }
@@ -659,6 +803,18 @@ export async function getHookStatus(settingsPath: string, tool?: string): Promis
     return present ? 'installed' : 'missing';
   }
 
+  if (format === 'zcode') {
+    const config = await readJson<ZcodeHooksJson>(expanded);
+    const events = config?.hooks?.events;
+    if (!events) return 'missing';
+    const present = defs.every((def) => {
+      const want = toZcodeEntry(def);
+      const entries = events[def.event] ?? [];
+      return entries.some((e) => e.matcher === want.matcher && e.hooks?.[0]?.command === want.hooks[0].command);
+    });
+    return present ? 'installed' : 'missing';
+  }
+
   const settings = await readJson<ClaudeSettingsJson>(expanded);
   if (!settings?.hooks) return 'missing';
   const present = defs.every((def) => {
@@ -703,6 +859,17 @@ export async function hasTeamaiHooks(
     const j = await readJson<CodexHooksJson>(expanded);
     if (!j?.hooks) return false;
     return Object.values(j.hooks).some((entries) =>
+      (entries ?? []).some((e) => {
+        const cmd = e.hooks?.[0]?.command ?? '';
+        return TEAMAI_COMMAND_MARKERS.some((m) => cmd.includes(m)) || priorTeamCommands.has(cmd);
+      }),
+    );
+  }
+
+  if (format === 'zcode') {
+    const c = await readJson<ZcodeHooksJson>(expanded);
+    if (!c?.hooks?.events) return false;
+    return Object.values(c.hooks.events).some((entries) =>
       (entries ?? []).some((e) => {
         const cmd = e.hooks?.[0]?.command ?? '';
         return TEAMAI_COMMAND_MARKERS.some((m) => cmd.includes(m)) || priorTeamCommands.has(cmd);
@@ -839,6 +1006,24 @@ export async function reconcileHooksToAllTools(
 }
 
 /**
+ * ZCode runs hooks ONLY from the user-level ~/.zcode/cli/config.json —
+ * workspace-level hooks are ignored entirely (ZCode logs them as
+ * `config_project_hooks_ignored`). The default zcode `settings` path is
+ * relative, so against a project-root base dir it would resolve to
+ * <repo>/.zcode/cli/config.json — a path ZCode never reads. In project scope
+ * the zcode settings path is stripped so hooks reconcile skips zcode instead
+ * of conjuring a junk file; `teamai hooks inject/remove` (always HOME-based)
+ * still manage the user-level file.
+ */
+export function hookToolPathsForScope<P extends Record<string, { settings?: string }>>(
+  toolPaths: P,
+  scope: 'user' | 'project',
+): P {
+  if (scope !== 'project' || !toolPaths.zcode?.settings) return toolPaths;
+  return { ...toolPaths, zcode: { ...toolPaths.zcode, settings: undefined } };
+}
+
+/**
  * Reconcile built-in (A) + team (B) hooks for a single scope's tools.
  * Parses the scope's hooks/hooks.yaml, resolves the scope base dir + manifest,
  * and reconciles every tool. Returns the team defs that were applied (for
@@ -862,7 +1047,7 @@ export async function reconcileTeamHooksForConfig(
     const universe = filterAgents ?? Object.keys(teamConfig.toolPaths);
     filterAgents = universe.filter((t) => !disabled.includes(t));
   }
-  await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, {
+  await reconcileHooksToAllTools(hookToolPathsForScope(teamConfig.toolPaths, localConfig.scope), baseDir, teamDefs, manifestPath, {
     removeAll: opts.removeAll,
     builtinOverride: builtin,
     filterAgents,
