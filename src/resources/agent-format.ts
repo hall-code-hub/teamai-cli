@@ -5,7 +5,7 @@ import { stringify as stringifyToml, parse as parseToml } from 'smol-toml';
 
 // ─── Tool name type ──────────────────────────────────────────────────────────
 
-export type ToolName = 'claude' | 'claude-internal' | 'tclaude' | 'codebuddy' | 'codex' | 'codex-internal' | 'tcodex' | 'cursor' | 'opencode';
+export type ToolName = 'claude' | 'claude-internal' | 'tclaude' | 'codebuddy' | 'codex' | 'codex-internal' | 'tcodex' | 'cursor' | 'opencode' | 'zcode';
 
 export const ALL_SUPPORTED_TOOLS: ToolName[] = [
   'claude',
@@ -17,6 +17,7 @@ export const ALL_SUPPORTED_TOOLS: ToolName[] = [
   'tcodex',
   'cursor',
   'opencode',
+  'zcode',
 ];
 
 // ─── Intermediate format ─────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ export interface AgentSpec {
     tcodex?: Record<string, unknown>;
     cursor?: Record<string, unknown>;
     opencode?: Record<string, unknown>;
+    zcode?: Record<string, unknown>;
   };
   /**
    * Which tools this agent should be deployed to.
@@ -224,6 +226,16 @@ export function renderForOpencode(spec: AgentSpec): RenderResult {
   return { ext: '.md', content };
 }
 
+/**
+ * Render an AgentSpec for ZCode (~/.zcode/agents/<name>.md).
+ * ZCode's subagent format is Claude-compatible Markdown + frontmatter
+ * (`name`/`description` required; `model`/`tools` use the same keys), so this
+ * delegates to the shared Markdown renderer with tool_extras.zcode.
+ */
+export function renderForZcode(spec: AgentSpec): RenderResult {
+  return { ext: '.md', content: renderMarkdownAgent(spec, spec.tool_extras?.['zcode']) };
+}
+
 // ─── Internal render helpers ─────────────────────────────────────────────────
 
 /**
@@ -341,6 +353,23 @@ export function reverseFromCodebuddy(filePath: string, content: string): Reverse
   // Move extras from 'claude' to 'codebuddy'
   if (spec.tool_extras?.['claude']) {
     spec.tool_extras = { codebuddy: spec.tool_extras['claude'] };
+  }
+  return { ok: true, spec };
+}
+
+/**
+ * Reverse a ZCode-format .md file into an AgentSpec.
+ * Format is identical to Claude (ZCode subagents are Claude-compatible), but
+ * tool_extras key is 'zcode'.
+ */
+export function reverseFromZcode(filePath: string, content: string): ReverseResult {
+  const result = reverseFromClaude(filePath, content);
+  if (!result.ok) return result;
+
+  const spec = result.spec;
+  // Move extras from 'claude' to 'zcode'
+  if (spec.tool_extras?.['claude']) {
+    spec.tool_extras = { zcode: spec.tool_extras['claude'] };
   }
   return { ok: true, spec };
 }
@@ -574,5 +603,6 @@ export function renderForTool(spec: AgentSpec, tool: ToolName): RenderResult {
     case 'tcodex': return renderForCodex(spec);
     case 'cursor': return renderForCursor(spec);
     case 'opencode': return renderForOpencode(spec);
+    case 'zcode': return renderForZcode(spec);
   }
 }

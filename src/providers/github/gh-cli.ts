@@ -17,12 +17,23 @@ function shellQuote(s: string): string {
 /** Returns the full path to gh if available on PATH, else null. */
 function getGhPath(): string | null {
   try {
-    const which = execSync('which gh', {
+    // On Windows, `which` may resolve to Git Bash's POSIX-style path (e.g.
+    // "/c/Program Files/GitHub CLI/gh"), which Node's spawnSync cannot
+    // execute (ENOENT). `where` returns a native Windows path instead.
+    const cmd = process.platform === 'win32' ? 'where gh' : 'which gh';
+    const which = execSync(cmd, {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const trimmed = which.trim();
-    return trimmed || null;
+    if (!trimmed) return null;
+    if (process.platform === 'win32') {
+      // `where` may list several matches (gh.cmd shim, gh.exe); spawnSync
+      // needs a real executable, so prefer the first .exe entry.
+      const lines = trimmed.split(/\r?\n/).filter(Boolean);
+      return lines.find((l) => l.toLowerCase().endsWith('.exe')) ?? lines[0];
+    }
+    return trimmed;
   } catch {
     return null;
   }

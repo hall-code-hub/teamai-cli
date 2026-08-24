@@ -5,7 +5,7 @@ import { builtinHookDefs } from './builtin-hooks.js';
 import { parseTeamHooks, resolveTeamHooks } from './resources/hooks.js';
 import { log } from './utils/logger.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
-import { resolveBaseDir, getManagedHooksPath } from './types.js';
+import { resolveBaseDir, getManagedHooksPath, isAgentDisabled } from './types.js';
 import { getUserHome } from './utils/home.js';
 
 type HookListStatus = HookStatus | 'not configured';
@@ -85,7 +85,17 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
         silent: options.silent,
     });
     for (const { baseDir, manifestPath } of resolveHookScopeTargets(localConfig)) {
-        await reconcileHooksToAllTools(teamConfig.toolPaths, baseDir, teamDefs, manifestPath, { builtinOverride: builtin });
+        // Respect local agent selection: never touch disabled agents, and when
+        // an explicit enabledAgents allowlist exists, restrict to it. Matches
+        // pull's hookFilter behavior — inject previously wrote every tool that
+        // happened to be installed, silently touching unregistered agents.
+        const enabled = new Set(localConfig.enabledAgents ?? []);
+        const filteredToolPaths = Object.fromEntries(
+            Object.entries(teamConfig.toolPaths).filter(
+                ([tool]) => !isAgentDisabled(localConfig, tool) && (enabled.size === 0 || enabled.has(tool)),
+            ),
+        );
+        await reconcileHooksToAllTools(filteredToolPaths, baseDir, teamDefs, manifestPath, { builtinOverride: builtin });
     }
 
     if (!options.silent) {

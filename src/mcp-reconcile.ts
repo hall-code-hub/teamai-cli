@@ -229,6 +229,43 @@ interface JsonDoc {
 }
 
 /**
+ * Resolve a dotted MCP_SERVER_KEY against a parsed config, level by level.
+ * `mcpServers` (no dot) is the identity; `mcp.servers` (ZCode) walks the two
+ * levels. A missing intermediate level reads as "no servers yet"; a present
+ * but non-object intermediate means the file holds config we do not
+ * understand, so the caller must abandon the injection.
+ */
+function readServerMap(data: Record<string, unknown>, serverKey: string): Record<string, unknown> | null {
+  let current: unknown = data;
+  for (const part of serverKey.split('.')) {
+    if (typeof current !== 'object' || current === null) return null;
+    current = (current as Record<string, unknown>)[part];
+  }
+  if (current === undefined) return {};
+  if (typeof current !== 'object' || current === null || Array.isArray(current)) return null;
+  return current as Record<string, unknown>;
+}
+
+/**
+ * Write the reconciled server map back under a dotted MCP_SERVER_KEY with
+ * key-level surgery: intermediate objects are recreated (not replaced), so
+ * sibling keys under `mcp` and every other top-level key survive untouched.
+ */
+function writeServerMap(data: Record<string, unknown>, serverKey: string, servers: Record<string, unknown>): void {
+  const parts = serverKey.split('.');
+  let current: Record<string, unknown> = data;
+  for (const part of parts.slice(0, -1)) {
+    let next = current[part];
+    if (typeof next !== 'object' || next === null) {
+      next = {};
+      current[part] = next;
+    }
+    current = next as Record<string, unknown>;
+  }
+  current[parts[parts.length - 1]!] = servers;
+}
+
+/**
  * Read a JSON MCP config. Returns null when the file exists but cannot be
  * parsed — we abandon the injection rather than risk clobbering a file we do
  * not understand (it may hold the user's OAuth session).
@@ -241,8 +278,8 @@ async function readJsonDoc(file: string, serverKey: string): Promise<JsonDoc | n
   try {
     const data = JSON.parse(raw) as Record<string, unknown>;
     if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
-    const servers = (data[serverKey] as Record<string, unknown>) ?? {};
-    if (typeof servers !== 'object' || servers === null || Array.isArray(servers)) return null;
+    const servers = readServerMap(data, serverKey);
+    if (servers === null) return null;
     return { data, servers: { ...servers } };
   } catch {
     return null;
@@ -460,8 +497,10 @@ async function applyJson(
   // Key-level surgery: every unrelated top-level key is carried over untouched.
   // Some tools (OpenCode) key the server map under `mcp`, not `mcpServers`;
   // writing the wrong key would strip the servers and, worse, leave a phantom
-  // empty `mcpServers` in a file the tool never reads under that name.
-  doc.data[serverKey] = doc.servers;
+  // empty `mcpServers` in a file the tool never reads under that name. ZCode
+  // nests it under `mcp.servers`; writeServerMap recreates the intermediate
+  // object so siblings under `mcp` survive too.
+  writeServerMap(doc.data, serverKey, doc.servers);
   await writeJsonAtomic(target.file, doc.data);
   return true;
 }

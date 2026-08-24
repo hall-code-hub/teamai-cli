@@ -14,6 +14,7 @@ import {
   reverseFromCodex,
   reverseFromCursor,
   reverseFromOpencode,
+  reverseFromZcode,
   mergeReverseResults,
   ALL_SUPPORTED_TOOLS,
 } from './agent-format.js';
@@ -472,5 +473,7 @@ function reverseByTool(tool: ToolName, filePath: string, content: string): Rever
       return reverseFromCursor(filePath, content);
     case 'opencode':
       return reverseFromOpencode(filePath, content);
+    case 'zcode':
+      return reverseFromZcode(filePath, content);
   }
 }

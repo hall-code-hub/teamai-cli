@@ -1134,7 +1134,7 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
   // Old format detected — reinject all tools
   log.debug('Auto-migrating hooks to dispatch format...');
   const { autoDetectInit } = await import('./config.js');
-  const { injectHooksToAllTools } = await import('./hooks.js');
+  const { injectHooksToAllTools, hookToolPathsForScope } = await import('./hooks.js');
   const { localConfig, teamConfig } = await autoDetectInit();
   const baseDir = resolveBaseDir(localConfig);
   const disabled = localConfig.disabledAgents;
@@ -1143,7 +1143,7 @@ async function autoMigrateHooksIfNeeded(): Promise<void> {
     const universe = hookFilter ?? Object.keys(teamConfig.toolPaths);
     hookFilter = universe.filter((t) => !disabled.includes(t));
   }
-  await injectHooksToAllTools(teamConfig.toolPaths, baseDir, hookFilter);
+  await injectHooksToAllTools(hookToolPathsForScope(teamConfig.toolPaths, localConfig.scope), baseDir, hookFilter);
   log.debug('Hooks migrated to dispatch format');
 }
 

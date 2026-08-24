@@ -224,6 +224,22 @@ export const TeamaiConfigSchema = z.object({
       mcpProject: 'opencode.json',
       userScope: { skills: '.config/opencode/skills', rules: '.config/opencode/rules', agents: '.config/opencode/agents' },
     },
+    // ZCode (zhipu) keeps skills/rules/agents at the same .zcode/<resource> path
+    // in both scopes, so no userScope. Its user-scope config file lives one level
+    // deeper (~/.zcode/cli/config.json) than the workspace one (<root>/.zcode/
+    // config.json), which the separate mcp/mcpProject settings fields express.
+    // settings targets the user-level file — the ONLY place ZCode runs hooks
+    // from (workspace hooks are ignored); hooks.ts strips it in project scope.
+    // No claudemd: user scope reads ~/.zcode/AGENTS.md but project scope reads
+    // <root>/AGENTS.md, and userScope cannot override claudemd (open item).
+    zcode: {
+      skills: '.zcode/skills',
+      rules: '.zcode/rules',
+      agents: '.zcode/agents',
+      settings: '.zcode/cli/config.json',
+      mcp: '.zcode/cli/config.json',
+      mcpProject: '.zcode/config.json',
+    },
   }),
 });
 
