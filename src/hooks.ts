@@ -929,6 +929,14 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
         }
       }
     } else if (tool === 'hermes') {
+      // Never conjure a ~/.hermes for a user who never installed it — only
+      // inject when the tool root already exists (mirrors the settings-path
+      // branch above).
+      const hermesRoot = path.join(resolvedBaseDir, '.hermes');
+      if (!(await pathExists(hermesRoot))) {
+        log.debug(`Skipping hook injection for hermes: tool not installed`);
+        continue;
+      }
       try {
         const { injectHermesHooks } = await import('./hermes-hooks.js');
         await injectHermesHooks();
