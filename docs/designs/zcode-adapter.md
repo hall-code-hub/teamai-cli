@@ -148,3 +148,16 @@ Implications:
   future ZCode build honors config-file hooks.
 - The injected `hooks` block is harmless (never executed); keep or remove
   at will.
+
+## Field finding CORRECTED (same evening, final)
+
+The "inert" conclusion above was wrong. ZCode does load and run config-file
+hooks on every session (no app restart needed) — they were *failing silently*:
+`bash -lc "…" || true` breaks under cmd.exe (`||` chains in cmd semantics,
+`true` is not a builtin) and non-JSON stdout fails strict validation
+(`hook.run.failed` events with `source: config.SessionStart.0.0` in ZCode's
+log were present all along). Fix in `fd5fae2`: render zcode entries as
+shell-free `process` hooks (node.exe + argv). Verified live: new session at
+20:09 pulled automatically (state.json lastPull updated, session_start
+reported, zero failures). Lesson: check the host's `hook.run.failed` events
+before concluding "not executed"; a silent-failure wrapper hides the truth.
