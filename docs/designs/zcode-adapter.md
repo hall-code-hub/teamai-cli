@@ -128,3 +128,23 @@ never touched.
   entries survive; `hookToolPathsForScope` strips zcode settings in project
   scope only.
 - registry: KNOWN_AGENTS has zcode; toolPaths default includes zcode.
+
+## Field finding (2026-08-24 evening, post-merge validation on real machine)
+
+**Config-file hooks are inert on ZCode 3.8.1.** Two fresh sessions plus an
+independent probe hook (timestamp appended to a file, no teamai involvement)
+produced zero executions, while the injected block is schema-compliant
+(`hooks.enabled: true` set, seven-event names, correct nesting) and the
+command itself runs fine manually (`teamai hook-dispatch session-start
+--tool zcode` exits 0). Conclusion: the config-file hooks channel documented
+at zcode.z.ai/docs/hooks does not actually execute on this build.
+
+Implications:
+- Skills/rules/agents/MCP sync for zcode is **unaffected** (those go through
+  `teamai pull`, not hooks) — zcode works as a **manual-pull** agent, like
+  codex was originally described.
+- The hooks auto-sync channel needs an alternative (plugin-shaped
+  `hooks/hooks.json` is documented to always run) or stays manual until a
+  future ZCode build honors config-file hooks.
+- The injected `hooks` block is harmless (never executed); keep or remove
+  at will.
